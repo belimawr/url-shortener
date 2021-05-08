@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,13 +14,15 @@ import (
 	"github.com/caarlos0/env/v6"
 	"github.com/go-chi/chi"
 	"github.com/google/uuid"
+	_ "github.com/lib/pq"
 	"github.com/rs/xid"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
 )
 
 type config struct {
-	Port int `env:"HTTP_PORT" envDefault:"3000"`
+	Port      int    `env:"HTTP_PORT" envDefault:"3000"`
+	DBConnStr string `env:"DB_CONN_STR" envDefault:"host=localhost user=db_user dbname=url sslmode=disable"`
 }
 
 type db map[string]*url.URL
@@ -33,7 +36,8 @@ func (d db) Get(key string) *url.URL {
 }
 
 type handler struct {
-	db db
+	db    db
+	sqlDB *sql.DB
 }
 
 func main() {
@@ -47,7 +51,21 @@ func main() {
 		Str("foo", "bar").
 		Logger()
 
-	h := handler{db: db{}}
+	logger = logger.Output(zerolog.NewConsoleWriter())
+
+	dbConn, err := sql.Open("postgres", cfg.DBConnStr)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("cannot connect to databse")
+	}
+
+	if err := dbConn.Ping(); err != nil {
+		logger.Fatal().Err(err).Msg("cannot ping database")
+	}
+
+	h := handler{
+		db:    db{},
+		sqlDB: dbConn,
+	}
 
 	r := chi.NewRouter()
 	r.Use(hlog.NewHandler(logger))
@@ -69,7 +87,8 @@ func main() {
 }
 
 func (h handler) saveURL(w http.ResponseWriter, r *http.Request) {
-	logger := zerolog.Ctx(r.Context())
+	ctx := r.Context()
+	logger := zerolog.Ctx(ctx)
 	// /save?url=http://golang.org
 	v := r.URL.Query().Get("url")
 	key := uuid.NewString()
@@ -85,7 +104,17 @@ func (h handler) saveURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.db[key] = parsedURL
+	// Save URL in memory
+	// h.db[key] = parsedURL
+
+	// Save URL in our sql
+	_, err = h.sqlDB.ExecContext(ctx, "INSERT INTO urls (token, url) VALUES ($1, $2);", key, parsedURL.String())
+	if err != nil {
+		logger.Error().Err(err).Msg("cannot insert into sql database")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		return
+	}
 
 	msg := fmt.Sprintf("Your new url is: %s", key)
 	w.Write([]byte(msg))
@@ -93,17 +122,35 @@ func (h handler) saveURL(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h handler) getURL(w http.ResponseWriter, r *http.Request) {
-	logger := zerolog.Ctx(r.Context())
+	ctx := r.Context()
+	logger := zerolog.Ctx(ctx)
 	// /go?to=uuidv4
 	key := r.URL.Query().Get("to")
-	requestedURL := h.db.Get(key)
-	if requestedURL == nil {
+	// requestedURL := h.db.Get(key)
+
+	var requestedURL string
+	row := h.sqlDB.QueryRowContext(ctx, "SELECT url FROM urls WHERE token=$1", key)
+
+	if err := row.Scan(&requestedURL); err != nil {
+		if err == sql.ErrNoRows {
+			logger.Debug().Msgf("cannot find URL for token: '%s'", key)
+			http.NotFound(w, r)
+			return
+		}
+
+		logger.Error().Err(err).Msg("cannot read data from database")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
+		return
+	}
+
+	if len(requestedURL) == 0 {
 		http.NotFound(w, r)
 		return
 	}
 
-	http.Redirect(w, r, requestedURL.String(), http.StatusTemporaryRedirect)
-	logger.Info().Msgf("getURL %s %s", key, requestedURL.String())
+	http.Redirect(w, r, requestedURL, http.StatusTemporaryRedirect)
+	logger.Info().Msgf("getURL %s %s", key, requestedURL)
 }
 
 func middleware(next http.Handler) http.Handler {
