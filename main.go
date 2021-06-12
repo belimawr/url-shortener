@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 
+	"github.com/belimawr/url-shortener/db"
 	"github.com/caarlos0/env/v6"
 	"github.com/go-chi/chi"
 	"github.com/google/uuid"
@@ -25,19 +26,17 @@ type config struct {
 	DBConnStr string `env:"DB_CONN_STR" envDefault:"host=localhost user=db_user dbname=url sslmode=disable"`
 }
 
-type db map[string]*url.URL
-
-func (d db) Set(key string, value *url.URL) {
-	d[key] = value
-}
-
-func (d db) Get(key string) *url.URL {
-	return d[key]
+type database interface {
+	Set(ctx context.Context, key, value string) error
+	Get(ctx context.Context, key string) (string, error)
 }
 
 type handler struct {
-	db    db
-	sqlDB *sql.DB
+	db database
+}
+
+func NewHandler(db database) handler {
+	return handler{db: db}
 }
 
 func main() {
@@ -62,20 +61,17 @@ func main() {
 		logger.Fatal().Err(err).Msg("cannot ping database")
 	}
 
-	h := handler{
-		db:    db{},
-		sqlDB: dbConn,
-	}
+	h := NewHandler(db.NewPostgres(dbConn))
+	//	h := NewHandler(inMemory{})
 
 	r := chi.NewRouter()
 	r.Use(hlog.NewHandler(logger))
 
 	r.Use(RequestIDHandler("req_id", "Request-Id"))
 	r.Use(hlog.RemoteAddrHandler("ip"))
-	// r.Use(hlog.UserAgentHandler("user_agent"))
-	// r.Use(hlog.RefererHandler("referer"))
-
-	r.Use(middleware)
+	r.Use(hlog.UserAgentHandler("user_agent"))
+	r.Use(hlog.RefererHandler("referer"))
+	r.Use(requestLogger)
 
 	r.Get("/save", h.saveURL)
 	r.Get("/go", h.getURL)
@@ -104,13 +100,9 @@ func (h handler) saveURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Save URL in memory
-	// h.db[key] = parsedURL
-
-	// Save URL in our sql
-	_, err = h.sqlDB.ExecContext(ctx, "INSERT INTO urls (token, url) VALUES ($1, $2);", key, parsedURL.String())
-	if err != nil {
-		logger.Error().Err(err).Msg("cannot insert into sql database")
+	// Save URL in our database
+	if err := h.db.Set(ctx, key, parsedURL.String()); err != nil {
+		logger.Error().Err(err).Msg("cannot insert into postgres database")
 		w.WriteHeader(http.StatusInternalServerError)
 		w.Write([]byte(http.StatusText(http.StatusInternalServerError)))
 		return
@@ -126,12 +118,10 @@ func (h handler) getURL(w http.ResponseWriter, r *http.Request) {
 	logger := zerolog.Ctx(ctx)
 	// /go?to=uuidv4
 	key := r.URL.Query().Get("to")
-	// requestedURL := h.db.Get(key)
 
-	var requestedURL string
-	row := h.sqlDB.QueryRowContext(ctx, "SELECT url FROM urls WHERE token=$1", key)
-
-	if err := row.Scan(&requestedURL); err != nil {
+	// SQL DB
+	strURL, err := h.db.Get(ctx, key)
+	if err != nil {
 		if err == sql.ErrNoRows {
 			logger.Debug().Msgf("cannot find URL for token: '%s'", key)
 			http.NotFound(w, r)
@@ -144,16 +134,11 @@ func (h handler) getURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(requestedURL) == 0 {
-		http.NotFound(w, r)
-		return
-	}
-
-	http.Redirect(w, r, requestedURL, http.StatusTemporaryRedirect)
-	logger.Info().Msgf("getURL %s %s", key, requestedURL)
+	http.Redirect(w, r, strURL, http.StatusTemporaryRedirect)
+	logger.Info().Msgf("getURL %s %s", key, strURL)
 }
 
-func middleware(next http.Handler) http.Handler {
+func requestLogger(next http.Handler) http.Handler {
 	fn := func(w http.ResponseWriter, r *http.Request) {
 		logger := zerolog.Ctx(r.Context())
 		logger.Info().Msgf("Request started, URL: %s, mehtod: %s", r.URL.String(), r.Method)
