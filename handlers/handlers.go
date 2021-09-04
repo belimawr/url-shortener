@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"net/url"
 
-	"github.com/google/uuid"
 	"github.com/rs/zerolog"
 )
 
@@ -21,12 +20,16 @@ type Database interface {
 // Shortener provides http.HandlerFunc methods to save
 // and get shortened URLs
 type Shortner struct {
-	db Database
+	db      Database
+	newUUID func() string
 }
 
 // New initialises and returns a new Sortener
-func New(db Database) Shortner {
-	return Shortner{db: db}
+func New(db Database, uuidFunc func() string) Shortner {
+	return Shortner{
+		db:      db,
+		newUUID: uuidFunc,
+	}
 }
 
 // SaveURL reads the `url` query string, generates a token for it and
@@ -37,7 +40,6 @@ func (s Shortner) SaveURL(w http.ResponseWriter, r *http.Request) {
 	logger := zerolog.Ctx(ctx)
 
 	v := r.URL.Query().Get("url")
-	key := uuid.NewString()
 
 	parsedURL, err := url.Parse(v)
 	if err != nil {
@@ -48,6 +50,7 @@ func (s Shortner) SaveURL(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	key := s.newUUID()
 	// Save URL in our database
 	if err := s.db.Set(ctx, key, parsedURL.String()); err != nil {
 		logger.Error().Err(err).Msg("cannot insert into database")

@@ -11,6 +11,7 @@ import (
 	"github.com/belimawr/url-shortener/middleware"
 	"github.com/caarlos0/env/v6"
 	"github.com/go-chi/chi"
+	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/hlog"
@@ -42,8 +43,7 @@ func main() {
 		logger.Panic().Err(err).Msg("cannot ping database")
 	}
 
-	//  h := NewHandler(db.NewPostgres(dbConn))
-	h := handlers.New(db.NewPostgres(dbConn))
+	h := handlers.New(db.NewPostgres(dbConn), uuid.NewString)
 
 	r := chi.NewRouter()
 	r.Use(hlog.NewHandler(logger))
